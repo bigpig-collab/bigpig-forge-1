@@ -389,8 +389,12 @@ export class Store {
     const out: { sha: string; message: string }[] = [];
     const seen = new Set<string>();
     const queue: string[] = [tip];
-    while (queue.length > 0) {
-      const oid = queue.shift() as string;
+    // Index pointer instead of shift(): shift() re-indexes the whole array
+    // on every pop, which is O(n) per commit on long histories.
+    let qi = 0;
+    while (qi < queue.length) {
+      const oid = queue[qi] as string;
+      qi += 1;
       if (seen.has(oid)) continue;
       seen.add(oid);
       const obj = repo.objects.get(oid);
@@ -408,8 +412,11 @@ export class Store {
     if (ancestor === tip) return true;
     const seen = new Set<string>();
     const queue: string[] = [tip];
-    while (queue.length > 0) {
-      const oid = queue.shift() as string;
+    // Index pointer instead of shift(): same O(n)-per-pop cost as listCommits.
+    let qi = 0;
+    while (qi < queue.length) {
+      const oid = queue[qi] as string;
+      qi += 1;
       if (seen.has(oid)) continue;
       seen.add(oid);
       const obj = repo.objects.get(oid);

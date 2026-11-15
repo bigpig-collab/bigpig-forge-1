@@ -9,10 +9,41 @@ import {
   errorResponse,
   isRecord,
   jsonResponse,
-  splitPath,
+  nextRequestId,
   type ApiRequest,
   type ApiResponse,
 } from './util.ts';
+
+/** The issue shape as a JSON string, built by hand: byte-identical to
+ *  JSON.stringify(issueShape(issue)) — same key order, same string
+ *  escaping (each string goes through JSON.stringify) — without allocating
+ *  the shape object and its per-label objects on the hottest path (2,000
+ *  sequential issue reads). */
+function issueJson(issue: Issue): string {
+  let labels = '';
+  for (let i = 0; i < issue.labels.length; i++) {
+    if (i > 0) labels += ',';
+    labels += `{"name":${JSON.stringify(issue.labels[i])}}`;
+  }
+  return (
+    `{"id":${JSON.stringify(issue.globalId)}` +
+    `,"number":${issue.number}` +
+    `,"title":${JSON.stringify(issue.title)}` +
+    `,"body":${JSON.stringify(issue.body)}` +
+    `,"state":${JSON.stringify(issue.state)}` +
+    `,"labels":[${labels}]}`
+  );
+}
+
+/** A JSON response whose body string is already built (no re-stringify). */
+function jsonResponseRaw(status: number, body: string): ApiResponse {
+  return {
+    status,
+    contentType: 'application/json; charset=utf-8',
+    body,
+    headers: { 'X-GitHub-Request-Id': nextRequestId() },
+  };
+}
 
 /** The public shape of one issue. */
 function issueShape(issue: Issue): Record<string, unknown> {
@@ -79,7 +110,7 @@ function queryInt(query: URLSearchParams, key: string, fallback: number): number
 }
 
 export function handleRest(req: ApiRequest): ApiResponse {
-  const parts = splitPath(req.pathname);
+  const parts = req.parts;
   // parts[0] === 'api', parts[1] === 'v3', the rest is the route.
   if (parts.length < 2 || parts[0] !== 'api' || parts[1] !== 'v3') {
     return errorResponse(404, 'not found');
@@ -239,6 +270,8 @@ function createGitRef(req: ApiRequest, owner: string, name: string): ApiResponse
   const obj = r.objects.get(sha.toLowerCase());
   if (!obj || obj.type !== 'commit') return errorResponse(422, 'sha is not a commit this repository holds');
   r.refs.set(ref, sha.toLowerCase());
+  // A ref moved: the cached advertisement/fetch for this repo is stale.
+  r.gen += 1;
   return jsonResponse(201, { ref, object: { sha: sha.toLowerCase() } });
 }
 
@@ -456,7 +489,7 @@ function createIssue(req: ApiRequest, owner: string, name: string): ApiResponse 
     if (!r.labels.has(label)) return errorResponse(422, `label ${label} does not exist`);
   }
   const issue = store.createIssue(r, title, issueBody, labels);
-  return jsonResponse(201, issueShape(issue));
+  return jsonResponseRaw(201, issueJson(issue));
 }
 
 function listIssues(req: ApiRequest, owner: string, name: string): ApiResponse {
@@ -484,7 +517,7 @@ function getIssue(owner: string, name: string, number: number): ApiResponse {
   const r = repo as Repo;
   const issue = store.getIssue(r, number);
   if (!issue) return errorResponse(404, `issue #${number} not found`);
-  return jsonResponse(200, issueShape(issue));
+  return jsonResponseRaw(200, issueJson(issue));
 }
 
 function patchIssue(req: ApiRequest, owner: string, name: string, number: number): ApiResponse {
@@ -496,7 +529,7 @@ function patchIssue(req: ApiRequest, owner: string, name: string, number: number
   const body = isRecord(req.json) ? req.json : {};
   if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
   else if (typeof body.state === 'string') return errorResponse(422, 'state must be open or closed');
-  return jsonResponse(200, issueShape(issue));
+  return jsonResponseRaw(200, issueJson(issue));
 }
 
 function createComment(req: ApiRequest, owner: string, name: string, number: number): ApiResponse {

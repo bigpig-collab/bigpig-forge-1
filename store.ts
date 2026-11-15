@@ -103,6 +103,17 @@ export interface Repo {
   nextPull: number;
   nextComment: number;
   seq: number;
+  /** Mutation generation: bumped on every object or ref change in this
+   *  repository. The git fetch/advertisement cache keys on (dbId, gen), so
+   *  any mutation invalidates every cached response for the repo; a
+   *  deleted-and-recreated repo gets a fresh dbId, so its cache keys can
+   *  never collide with the old repo's. */
+  gen: number;
+}
+
+/** Bump a repository's mutation generation (see Repo.gen). */
+export function touchRepo(repo: Repo): void {
+  repo.gen += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +237,7 @@ export class Store {
       nextPull: 1,
       nextComment: 1,
       seq: this.nextSeq,
+      gen: 0,
     };
     this.nextSeq += 1;
     this.reposByKey.set(this.key(VIEWER.login, name), repo);
@@ -262,6 +274,8 @@ export class Store {
   putObject(repo: Repo, type: ObjType, bytes: Buffer): string {
     const oid = gitObjectId(type, bytes);
     repo.objects.set(oid, { type, bytes });
+    // Every new object changes what a fetch can return.
+    repo.gen += 1;
     return oid;
   }
 
@@ -450,6 +464,9 @@ export class Store {
     const newTree = this.setPathInTree(repo, treeOid, path, blobSha);
     const commitSha = this.makeCommit(repo, newTree, parents, message);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    // The ref moved (and objects were created above): the cached
+    // advertisement/fetch for this repo is stale.
+    repo.gen += 1;
     return { commitSha, blobSha, created };
   }
 
@@ -463,6 +480,7 @@ export class Store {
     const newTree = this.setPathInTree(repo, commit.tree, path, null);
     const commitSha = this.makeCommit(repo, newTree, [tip], message);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    repo.gen += 1;
     return { commitSha };
   }
 
@@ -647,6 +665,7 @@ export class Store {
     treeOid = buildFromFlat('');
     const mergeSha = this.makeCommit(repo, treeOid, [baseTip], `Merge pull request #${pr.number}`);
     repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+    repo.gen += 1;
     pr.state = 'closed';
     pr.merged = true;
     pr.mergedAt = MERGED_AT;

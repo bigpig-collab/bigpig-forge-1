@@ -52,6 +52,9 @@ export function lineCount(text: string): number {
 export interface ApiRequest {
   method: string;
   pathname: string;
+  /** The pathname's `/`-separated segments (empty ones dropped), split once
+   *  in toApiRequest so the router and the handlers do not re-split it. */
+  parts: string[];
   query: URLSearchParams;
   headers: Record<string, string>;
   rawBody: Buffer;

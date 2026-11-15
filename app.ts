@@ -43,7 +43,24 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function toApiRequest(req: IncomingMessage, rawBody: Buffer): ApiRequest {
-  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  // `new URL(...)` per request is pure overhead on the hottest path (2,000
+  // sequential issue reads): it parses scheme/host/port we never use. The
+  // request-target here is always an origin-form path, so split it by hand:
+  // strip a fragment, split off the query, and build the search params from
+  // the raw query string (URLSearchParams decodes values exactly as URL
+  // would). The pathname keeps its percent-encoding, as URL.pathname does;
+  // handlers decode segments where they need to.
+  const raw = req.url ?? '/';
+  let pathname = raw;
+  let rawQuery = '';
+  const hash = pathname.indexOf('#');
+  if (hash >= 0) pathname = pathname.slice(0, hash);
+  const q = pathname.indexOf('?');
+  if (q >= 0) {
+    rawQuery = pathname.slice(q + 1);
+    pathname = pathname.slice(0, q);
+  }
+  if (pathname.length === 0) pathname = '/';
   // Node's IncomingMessage already lowercases every header name, so there is
   // no need to rebuild a lowered copy per request; the raw headers object is
   // used directly (the values this server reads are single strings).
@@ -60,8 +77,9 @@ function toApiRequest(req: IncomingMessage, rawBody: Buffer): ApiRequest {
   }
   return {
     method: req.method ?? 'GET',
-    pathname: url.pathname,
-    query: url.searchParams,
+    pathname,
+    parts: splitPath(pathname),
+    query: new URLSearchParams(rawQuery),
     headers,
     rawBody,
     json,
@@ -90,7 +108,7 @@ async function route(apiReq: ApiRequest): Promise<ApiResponse> {
     return handleRest(apiReq);
   }
   // Git smart HTTP: /<owner>/<repo>.git[/info/refs|/git-upload-pack|/git-receive-pack]
-  const parts = splitPath(pathname);
+  const parts = apiReq.parts;
   if (parts.length >= 1 && parts[0].endsWith('.git')) {
     return handleGit(apiReq);
   }

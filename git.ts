@@ -115,11 +115,58 @@ const UPLOAD_V0_CAPS =
 const RECEIVE_V0_CAPS =
   'symref=HEAD:refs/heads/main report-status report-status-v2 side-band-64k delete-refs ofs-delta thin-pack agent=forge/1.0';
 
-function v2Advert(): Buffer {
+// ---------------------------------------------------------------------------
+// Deterministic-response cache (fetch + v0 advertisement)
+// ---------------------------------------------------------------------------
+//
+// An upload-pack fetch response and a v0 advertisement are pure functions
+// of (repository state, request parameters): same repo, same wants / haves /
+// depth / shallow, same bytes — deflate is deterministic, the pack is laid
+// out in a fixed order, and no clock or randomness feeds in. So they are
+// cached, keyed by the repository's (dbId, gen) plus the request's
+// parameters; any object or ref mutation bumps gen and retires every cached
+// response for the repo, and a deleted-and-recreated repo gets a fresh dbId
+// so its keys can never collide with the old repo's. This matters most for
+// the clone workload: 50 concurrent depth-1 clones of one repo are 50
+// identical fetch requests, and without the cache the server rebuilds the
+// same pack 50 times. The cached Buffers are never mutated (send() only
+// ends the response with them), so sharing them across responses is safe.
+// Entries are capped (16 entries, 512 KiB each) and evicted oldest-first.
+interface CachedGitResponse {
+  body: Buffer;
+  contentType: string;
+}
+
+const gitResponseCache = new Map<string, CachedGitResponse>();
+const GIT_CACHE_MAX_ENTRIES = 16;
+const GIT_CACHE_MAX_BYTES = 512 << 10;
+
+function gitCacheGet(key: string): CachedGitResponse | undefined {
+  return gitResponseCache.get(key);
+}
+
+function gitCachePut(key: string, entry: CachedGitResponse): void {
+  if (entry.body.length > GIT_CACHE_MAX_BYTES) return;
+  gitResponseCache.delete(key);
+  gitResponseCache.set(key, entry);
+  while (gitResponseCache.size > GIT_CACHE_MAX_ENTRIES) {
+    const oldest = gitResponseCache.keys().next().value;
+    if (oldest === undefined) break;
+    gitResponseCache.delete(oldest);
+  }
+}
+
+/** The protocol-v2 advertisement: the same five capability lines for every
+ *  repository, so it is built once, not once per info/refs request. */
+const V2_ADVERT: Buffer = (() => {
   const lines = ['version 2', 'fetch=shallow', 'ls-refs=unborn', 'object-format=sha1', 'agent=forge/1.0'];
   const parts: Buffer[] = lines.map((line) => pkt(`${line}\n`));
   parts.push(FLUSH);
   return Buffer.concat(parts);
+})();
+
+function v2Advert(): Buffer {
+  return V2_ADVERT;
 }
 
 function v0Advert(repo: Repo, service: string, caps: string): Buffer {
@@ -153,17 +200,29 @@ function handleInfoRefs(req: ApiRequest, repo: Repo): ApiResponse {
     if (wantsV2) {
       return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v2Advert() };
     }
+    // The v0 advertisement is a pure function of (repo state, service):
+    // cache it — every push and every clone issues one.
+    const cacheKey = `a:${repo.dbId}:${repo.gen}:git-upload-pack`;
+    const cached = gitCacheGet(cacheKey);
+    if (cached) return { status: 200, contentType: cached.contentType, body: cached.body };
+    const body = v0Advert(repo, 'git-upload-pack', UPLOAD_V0_CAPS);
+    gitCachePut(cacheKey, { body, contentType: 'application/x-git-upload-pack-advertisement' });
     return {
       status: 200,
       contentType: 'application/x-git-upload-pack-advertisement',
-      body: v0Advert(repo, 'git-upload-pack', UPLOAD_V0_CAPS),
+      body,
     };
   }
   if (service === 'git-receive-pack') {
+    const cacheKey = `a:${repo.dbId}:${repo.gen}:git-receive-pack`;
+    const cached = gitCacheGet(cacheKey);
+    if (cached) return { status: 200, contentType: cached.contentType, body: cached.body };
+    const body = v0Advert(repo, 'git-receive-pack', RECEIVE_V0_CAPS);
+    gitCachePut(cacheKey, { body, contentType: 'application/x-git-receive-pack-advertisement' });
     return {
       status: 200,
       contentType: 'application/x-git-receive-pack-advertisement',
-      body: v0Advert(repo, 'git-receive-pack', RECEIVE_V0_CAPS),
+      body,
     };
   }
   return errorResponse(400, 'unknown service');
@@ -545,6 +604,13 @@ function handleFetchV2(repo: Repo, packets: Pkt[]): ApiResponse {
       if (d !== undefined) depth = d;
     }
   }
+  // The fetch response is a pure function of (repo state, wants, haves,
+  // depth, shallow): identical requests return identical bytes, so cache it
+  // (the 50 concurrent clones of one repo are 50 identical fetches).
+  const cacheKey =
+    `f:${repo.dbId}:${repo.gen}:v2:${wants.join(',')}:${haves.join(',')}:${depth ?? ''}:${shallow.join(',')}`;
+  const cached = gitCacheGet(cacheKey);
+  if (cached) return { status: 200, contentType: cached.contentType, body: cached.body };
   const plan = planFetch(repo, wants, haves, shallow, depth);
   const pack = buildPack(repo, plan.packOids);
 
@@ -565,7 +631,9 @@ function handleFetchV2(repo: Repo, packets: Pkt[]): ApiResponse {
   parts.push(pkt('packfile\n'));
   for (const sideband of sidebandPackets(pack)) parts.push(sideband);
   parts.push(FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  gitCachePut(cacheKey, { body, contentType: 'application/x-git-upload-pack-result' });
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
 }
 
 function handleFetchV0(repo: Repo, packets: Pkt[]): ApiResponse {
@@ -597,6 +665,11 @@ function handleFetchV0(repo: Repo, packets: Pkt[]): ApiResponse {
   for (const line of haveSection) {
     if (line.startsWith('have ')) haves.push(line.slice(5).trim());
   }
+  // Same pure-function argument as handleFetchV2: cache the response.
+  const cacheKey =
+    `f:${repo.dbId}:${repo.gen}:v0:${wants.join(',')}:${haves.join(',')}:${depth ?? ''}:${shallow.join(',')}`;
+  const cached = gitCacheGet(cacheKey);
+  if (cached) return { status: 200, contentType: cached.contentType, body: cached.body };
   const plan = planFetch(repo, wants, haves, shallow, depth);
   const pack = buildPack(repo, plan.packOids);
 
@@ -610,7 +683,9 @@ function handleFetchV0(repo: Repo, packets: Pkt[]): ApiResponse {
   for (const oid of plan.unshallow) parts.push(pkt(`unshallow ${oid}\n`));
   for (const sideband of sidebandPackets(pack)) parts.push(sideband);
   parts.push(FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  gitCachePut(cacheKey, { body, contentType: 'application/x-git-upload-pack-result' });
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
 }
 
 function handleUploadPack(req: ApiRequest, repo: Repo): ApiResponse {
@@ -1004,6 +1079,11 @@ async function handleReceivePack(req: ApiRequest, repo: Repo): Promise<ApiRespon
     }
   }
 
+  // Pack objects were stored above (direct repo.objects.set) and refs may
+  // have moved: bump the generation so every cached fetch/advertisement for
+  // this repo retires.
+  repo.gen += 1;
+
   // report-status inside sideband band 1: the band-1 bytes are themselves a
   // pkt-line stream (report lines, then a flush).
   const innerParts: Buffer[] = [pkt('unpack ok\n')];
@@ -1023,7 +1103,7 @@ async function handleReceivePack(req: ApiRequest, repo: Repo): Promise<ApiRespon
 export async function handleGit(req: ApiRequest): Promise<ApiResponse> {
   try {
     if (!req.authed) return errorResponse(401, 'authentication required');
-    const parts = req.pathname.split('/').filter((part) => part.length > 0);
+    const parts = req.parts;
     if (parts.length < 2 || !parts[1]?.endsWith('.git')) return errorResponse(404, 'repository not found');
     const owner = parts[0] as string;
     const repoName = (parts[1] as string).slice(0, -4);

@@ -8,10 +8,14 @@ export function sha1Hex(data: Uint8Array): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
-/** SHA-1 of a git object: header `<type> <size>\0` + bytes. */
+/** SHA-1 of a git object: header `<type> <size>\0` + bytes. The hash is fed
+ *  incrementally (header, then bytes) so no concatenated copy of the object
+ *  is allocated on the hottest path (every pushed object is hashed once). */
 export function gitObjectId(type: string, bytes: Uint8Array): string {
-  const header = Buffer.from(`${type} ${bytes.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, Buffer.from(bytes)]));
+  const hash = createHash('sha1');
+  hash.update(`${type} ${bytes.length}\0`, 'utf8');
+  hash.update(bytes);
+  return hash.digest('hex');
 }
 
 /** The all-zero object id: an unborn ref's old/new value. */

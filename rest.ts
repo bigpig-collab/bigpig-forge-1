@@ -35,14 +35,22 @@ function issueJson(issue: Issue): string {
   );
 }
 
-/** A JSON response whose body string is already built (no re-stringify). */
-function jsonResponseRaw(status: number, body: string): ApiResponse {
+/** A JSON response whose body is an already-built Buffer (no re-stringify,
+ *  no re-encode: the bytes go to the socket verbatim). */
+function jsonResponseBuf(status: number, body: Buffer): ApiResponse {
   return {
     status,
     contentType: 'application/json; charset=utf-8',
     body,
     headers: { 'X-GitHub-Request-Id': nextRequestId() },
   };
+}
+
+/** The frozen response bytes for one issue: built once from issueJson and
+ *  kept on the issue; rebuilt only when a patch changes the shape. */
+function issueBuf(issue: Issue): Buffer {
+  if (issue.jsonBuf === null) issue.jsonBuf = Buffer.from(issueJson(issue), 'utf8');
+  return issue.jsonBuf;
 }
 
 /** The public shape of one issue. */
@@ -489,7 +497,7 @@ function createIssue(req: ApiRequest, owner: string, name: string): ApiResponse 
     if (!r.labels.has(label)) return errorResponse(422, `label ${label} does not exist`);
   }
   const issue = store.createIssue(r, title, issueBody, labels);
-  return jsonResponseRaw(201, issueJson(issue));
+  return jsonResponseBuf(201, issueBuf(issue));
 }
 
 function listIssues(req: ApiRequest, owner: string, name: string): ApiResponse {
@@ -517,7 +525,7 @@ function getIssue(owner: string, name: string, number: number): ApiResponse {
   const r = repo as Repo;
   const issue = store.getIssue(r, number);
   if (!issue) return errorResponse(404, `issue #${number} not found`);
-  return jsonResponseRaw(200, issueJson(issue));
+  return jsonResponseBuf(200, issueBuf(issue));
 }
 
 function patchIssue(req: ApiRequest, owner: string, name: string, number: number): ApiResponse {
@@ -529,7 +537,9 @@ function patchIssue(req: ApiRequest, owner: string, name: string, number: number
   const body = isRecord(req.json) ? req.json : {};
   if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
   else if (typeof body.state === 'string') return errorResponse(422, 'state must be open or closed');
-  return jsonResponseRaw(200, issueJson(issue));
+  // The state changed (or was re-asserted): the frozen bytes are stale.
+  issue.jsonBuf = null;
+  return jsonResponseBuf(200, issueBuf(issue));
 }
 
 function createComment(req: ApiRequest, owner: string, name: string, number: number): ApiResponse {

@@ -646,6 +646,8 @@ function resolveField(
         const found = store.getIssueByGlobalId(String(input.issueId ?? ''));
         if (found === undefined) throw new OpError(`Issue not found: ${String(input.issueId ?? '')}`);
         found.issue.state = 'closed';
+        // The state changed: the issue's frozen REST bytes are stale.
+        found.issue.jsonBuf = null;
         return { type: 'CloseIssuePayload', value: { issue: found.issue } };
       }
       if (fieldName === 'createPullRequest') {

@@ -67,6 +67,12 @@ export interface Issue {
   labels: string[];
   seq: number;
   comments: IssueComment[];
+  /** Frozen response bytes for this issue's REST shape, built once (on
+   *  create, or lazily on first REST read) and rebuilt on patch: the read
+   *  workload GETs one issue 2,000 times, so its response must cost zero
+   *  serialization. Comments never appear in the shape, so they do not
+   *  invalidate it; only a state patch does. */
+  jsonBuf: Buffer | null;
 }
 
 export interface PullRequest {
@@ -498,6 +504,7 @@ export class Store {
       labels: [...labels],
       seq: repo.issues.length + 1,
       comments: [],
+      jsonBuf: null,
     };
     repo.issues.push(issue);
     return issue;
